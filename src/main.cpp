@@ -3,26 +3,28 @@
 #include <TFT_eSPI.h>
 #include <TJpg_Decoder.h>
 #include <WiFiUdp.h>
-#include <esp_task_wdt.h> // Watchdog for auto-reboot
 
 // --- CONFIGURATION ---
 const char* wifi_ssid = "streaming"; 
 const char* wifi_pass = "12345678";
-const char* ap_ssid   = "ESP32-Stream";
-const char* ap_pass   = "12345678";
 const int udpPort = 12345;
+const int BOOT_PIN = 0; // Standard Boot button on ESP32
+
 
 #define MAX_JPEG_SIZE 20000 
 #define BUFFER_COUNT 2
-#define WDT_TIMEOUT 5 // Reboot if frozen for 5 seconds
 
+// --- SLEEP SETTINGS ---
+// 1. "After boot, count for set amount of second" (e.g., 10s)
+const unsigned long BOOT_CHECK_TIMEOUT = 10000; 
+
+// --- OBJECTS ---
 TFT_eSPI tft = TFT_eSPI();
 WiFiUDP udp;
 
 // --- PING-PONG BUFFERS ---
 TFT_eSprite* spr[2]; 
 uint8_t sprIdx = 0;          
-bool firstFrame = true;      
 
 // --- NETWORK VARIABLES ---
 uint32_t stat_packetsReceived = 0;
@@ -45,14 +47,15 @@ uint8_t rxBuffer[1470];
 uint32_t currentFrameSize = 0;
 uint8_t expectedChunk = 0;
 bool isFrameCorrupt = false;
-unsigned long lastPacketTime = 0;
-bool isAPMode = false;
+volatile unsigned long lastPacketTime = 0; // Volatile as modified in ISR/Task
+
+// --- SLEEP CONTROL FLAGS ---
+bool sleepCheckPerformed = false;
+volatile bool isSleeping = false;
 
 // --- TFT RENDERING CALLBACK ---
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  // BOUNDARY GUARD: Prevents the "White Screen" memory crash
   if (x < 0 || y < 0 || (x + w) > 160 || (y + h) > 128) return 0;
-  
   if (y >= tft.height()) return 0;
   spr[sprIdx]->pushImage(x, y, w, h, bitmap);
   return 1;
@@ -62,6 +65,12 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
 void networkTask(void * parameter) {
   udp.begin(udpPort);
   while (true) {
+    // If we are sleeping, pause the task to allow WiFi to be off
+    if (isSleeping) {
+        vTaskDelay(100);
+        continue;
+    }
+
     int packetSize = udp.parsePacket();
     
     // Keep-alive
@@ -78,10 +87,9 @@ void networkTask(void * parameter) {
       
       udp.read(rxBuffer, 1470); 
       
-      // MAGIC BYTE FILTER: [0xAA, 0xBB, ChunkID, ...Data]
       if (rxBuffer[0] != 0xAA || rxBuffer[1] != 0xBB) {
         taskYIELD();
-        continue; // Ignore noise
+        continue; 
       }
 
       uint8_t chunkID = rxBuffer[2]; 
@@ -125,13 +133,52 @@ void networkTask(void * parameter) {
   }
 }
 
-void setup() {
-  Serial.begin(115200);
+// --- LIGHT SLEEP FUNCTION ---
+void enterLightSleep() {
+  Serial.println(">> ENTERING SLEEP MODE...");
+  isSleeping = true; // Pause Network Task
+
+  // 1. Show Status on Screen
+  tft.fillScreen(TFT_BROWN);
+
+  // 2. Disable WiFi to save power
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // 3. Setup Wakeup Source (BOOT Button = GPIO 0, Active Low)
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_PIN, 0); 
+
+  // 4. Enter Light Sleep
+  // The CPU pauses here. RAM is retained. 
+  // It resumes from the next line when the button is pressed.
+  esp_light_sleep_start();
+
+  // --- WAKE UP SEQUENCE ---
+  Serial.println(">> WAKING UP...");
+
+  // 5. Reconnect WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_pass);
+  WiFi.setSleep(false);
+  tft.fillScreen(TFT_CYAN);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(100);
+    Serial.print(".");
+  }
   
-  // WATCHDOG INIT: If the board freezes for >5s, it will auto-reboot.
-  // This replaces the manual "dma timeout" loop.
-  esp_task_wdt_init(WDT_TIMEOUT, true);
-  esp_task_wdt_add(NULL); 
+  // 6. Restart UDP
+  udp.begin(udpPort);
+  lastPacketTime = millis(); // Reset timer to prevent immediate re-sleep loop
+  isSleeping = false;        // Resume Network Task
+  tft.fillScreen(TFT_GREEN);
+}
+
+
+
+void setup() {
+
+  Serial.begin(115200);
+  pinMode(BOOT_PIN, INPUT_PULLUP);
 
   for (int i=0; i<BUFFER_COUNT; i++) {
     jpegBuffers[i] = (uint8_t*)malloc(MAX_JPEG_SIZE);
@@ -139,8 +186,8 @@ void setup() {
 
   tft.init();
   tft.initDMA(); 
-  tft.setRotation(3);
-  tft.fillScreen(TFT_BLACK);
+  tft.setRotation(1);
+  tft.fillScreen(TFT_RED);
   tft.setSwapBytes(true); 
 
   spr[0] = new TFT_eSprite(&tft);
@@ -158,35 +205,47 @@ void setup() {
   WiFi.setSleep(false); 
   WiFi.begin(wifi_ssid, wifi_pass);
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
-    delay(500);
-    attempts++;
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) { 
+    delay(300);
+    retries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    isAPMode = false;
     Serial.print("Connected! IP: ");
     Serial.println(WiFi.localIP());
-  } else {
-    isAPMode = true;
-    WiFi.disconnect();
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(ap_ssid, ap_pass, 6, 0, 1); 
-    Serial.print("AP Mode Started. IP: ");
-    Serial.println(WiFi.softAPIP());
+    tft.fillScreen(TFT_GREEN);
   }
 
   xTaskCreatePinnedToCore(networkTask, "WiFiTask", 10000, NULL, 2, NULL, 0);
   stat_lastReportTime = millis();
+  
+  // Important: Initialize lastPacketTime to millis() so the "half time" logic 
+  // works correctly relative to boot.
+  lastPacketTime = millis(); 
+
   tft.startWrite(); 
 }
 
 void loop() {
-  // FEED THE DOG: Tell the system we are still alive
-  esp_task_wdt_reset();
+  // --- ONE-TIME SLEEP CHECK ---
+  // Runs once after BOOT_CHECK_TIMEOUT (e.g., 10 seconds)
+  if (!sleepCheckPerformed && millis() > BOOT_CHECK_TIMEOUT) {
+      sleepCheckPerformed = true; 
 
-  if (frameReady) {
+      bool wifiNotConnected = (WiFi.status() != WL_CONNECTED);
+      
+      // "Record time of receiving packet is less than a half of set time"
+      // If Timeout is 10s, Half is 5s. 
+      // If lastPacketTime < 5000 (meaning we haven't heard anything in the last 5 seconds)
+      bool dataIsStale = (lastPacketTime < (BOOT_CHECK_TIMEOUT / 2));
+
+      if (wifiNotConnected || dataIsStale) {
+          enterLightSleep();
+      }
+  }
+
+  if (!isSleeping && frameReady) {
     uint32_t startTime = millis();
     
     // Jitter Calc
@@ -202,13 +261,9 @@ void loop() {
     stat_prevFrameTime = startTime;
     stat_totalJpegBytes += frameSizes[writeIdx];
 
-    // Decode
     TJpgDec.drawJpg(0, 0, jpegBuffers[writeIdx], frameSizes[writeIdx]);
     
-    // SAFE DMA WAIT: 
-    // If SPI hangs here, the Watchdog (WDT) above will detect it 
-    // after 5 seconds and reset the board.
-    tft.dmaWait();
+    tft.dmaWait(); // Standard wait
 
     tft.pushImageDMA(0, 0, tft.width(), tft.height(), (uint16_t*)spr[sprIdx]->getPointer());
     sprIdx = !sprIdx; 
@@ -216,7 +271,7 @@ void loop() {
     frameReady = false; 
   }
 
-  // Reporting
+  // --- REPORTING (FULL STATS RESTORED) ---
   uint32_t timeDiff = millis() - stat_lastReportTime;
   if (timeDiff > 2000) {
     float fps = (float)stat_framesReceived / (timeDiff / 1000.0);
