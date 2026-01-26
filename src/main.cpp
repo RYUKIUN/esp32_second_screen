@@ -3,6 +3,8 @@
 #include <TFT_eSPI.h>
 #include <TJpg_Decoder.h>
 #include <WiFiUdp.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 
 // --- CONFIGURATION ---
 const char* wifi_ssid = "streaming"; 
@@ -10,12 +12,10 @@ const char* wifi_pass = "12345678";
 const int udpPort = 12345;
 const int BOOT_PIN = 0; // Standard Boot button on ESP32
 
-
 #define MAX_JPEG_SIZE 20000 
 #define BUFFER_COUNT 2
 
 // --- SLEEP SETTINGS ---
-// 1. "After boot, count for set amount of second" (e.g., 10s)
 const unsigned long BOOT_CHECK_TIMEOUT = 20000; 
 
 // --- OBJECTS ---
@@ -47,11 +47,31 @@ uint8_t rxBuffer[1470];
 uint32_t currentFrameSize = 0;
 uint8_t expectedChunk = 0;
 bool isFrameCorrupt = false;
-volatile unsigned long lastPacketTime = 0; // Volatile as modified in ISR/Task
+volatile unsigned long lastPacketTime = 0; 
 
 // --- SLEEP CONTROL FLAGS ---
 bool sleepCheckPerformed = false;
 volatile bool isSleeping = false;
+
+// --- APP SWITCHER FUNCTION ---
+void switchToOtherApp() {
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    const esp_partition_t* next = NULL;
+
+    // Toggle between OTA_0 and OTA_1
+    if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
+        next = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+    } else {
+        next = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    }
+
+    if (next != NULL) {
+        Serial.println(">> SWITCHING APP PARTITION...");
+        esp_ota_set_boot_partition(next);
+        delay(100);
+        esp_restart();
+    }
+}
 
 // --- TFT RENDERING CALLBACK ---
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
@@ -65,7 +85,6 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
 void networkTask(void * parameter) {
   udp.begin(udpPort);
   while (true) {
-    // If we are sleeping, pause the task to allow WiFi to be off
     if (isSleeping) {
         vTaskDelay(100);
         continue;
@@ -73,7 +92,6 @@ void networkTask(void * parameter) {
 
     int packetSize = udp.parsePacket();
     
-    // Keep-alive
     if (millis() - lastPacketTime > 2000) {
       udp.beginPacket(IPAddress(255,255,255,255), udpPort);
       udp.print("ESP32_READY");
@@ -136,27 +154,16 @@ void networkTask(void * parameter) {
 // --- LIGHT SLEEP FUNCTION ---
 void enterLightSleep() {
   Serial.println(">> ENTERING SLEEP MODE...");
-  isSleeping = true; // Pause Network Task
+  isSleeping = true; 
 
-  // 1. Show Status on Screen
   tft.fillScreen(TFT_BROWN);
-
-  // 2. Disable WiFi to save power
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-
-  // 3. Setup Wakeup Source (BOOT Button = GPIO 0, Active Low)
   esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_PIN, 0); 
-
-  // 4. Enter Light Sleep
-  // The CPU pauses here. RAM is retained. 
-  // It resumes from the next line when the button is pressed.
   esp_light_sleep_start();
 
   // --- WAKE UP SEQUENCE ---
   Serial.println(">> WAKING UP...");
-
-  // 5. Reconnect WiFi
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifi_ssid, wifi_pass);
   WiFi.setSleep(false);
@@ -166,17 +173,13 @@ void enterLightSleep() {
     Serial.print(".");
   }
   
-  // 6. Restart UDP
   udp.begin(udpPort);
-  lastPacketTime = millis(); // Reset timer to prevent immediate re-sleep loop
-  isSleeping = false;        // Resume Network Task
+  lastPacketTime = millis(); 
+  isSleeping = false;        
   tft.fillScreen(TFT_GREEN);
 }
 
-
-
 void setup() {
-
   Serial.begin(115200);
   pinMode(BOOT_PIN, INPUT_PULLUP);
 
@@ -219,25 +222,50 @@ void setup() {
 
   xTaskCreatePinnedToCore(networkTask, "WiFiTask", 10000, NULL, 2, NULL, 0);
   stat_lastReportTime = millis();
-  
-  // Important: Initialize lastPacketTime to millis() so the "half time" logic 
-  // works correctly relative to boot.
   lastPacketTime = millis(); 
 
   tft.startWrite(); 
 }
 
 void loop() {
+  // --- BUTTON CHECK (APP SWITCHER) ---
+  static unsigned long btnPressStart = 0;
+  static bool btnHeld = false;
+  
+  // Check button (Active LOW)
+  if (digitalRead(BOOT_PIN) == LOW) {
+      if (!btnHeld) {
+          btnPressStart = millis();
+          btnHeld = true;
+      }
+      
+      unsigned long duration = millis() - btnPressStart;
+      
+      // Visual Indicator while holding > 1s
+      if (duration > 1000 && duration < 4000) {
+          tft.setTextColor(TFT_RED, TFT_BLACK);
+          tft.setCursor(5, 5);
+          tft.print("HOLD TO SWITCH: ");
+          tft.print((4000 - (long)duration)/1000); 
+      }
+
+      // Trigger Switch after 4 seconds
+      if (duration > 4000) {
+          tft.fillScreen(TFT_RED);
+          tft.setCursor(10, 60);
+          tft.setTextColor(TFT_WHITE);
+          tft.print("SWITCHING APP...");
+          delay(500); 
+          switchToOtherApp();
+      }
+  } else {
+      btnHeld = false; // Reset
+  }
+
   // --- ONE-TIME SLEEP CHECK ---
-  // Runs once after BOOT_CHECK_TIMEOUT (e.g., 10 seconds)
   if (!sleepCheckPerformed && millis() > BOOT_CHECK_TIMEOUT) {
       sleepCheckPerformed = true; 
-
       bool wifiNotConnected = (WiFi.status() != WL_CONNECTED);
-      
-      // "Record time of receiving packet is less than a half of set time"
-      // If Timeout is 10s, Half is 5s. 
-      // If lastPacketTime < 5000 (meaning we haven't heard anything in the last 5 seconds)
       bool dataIsStale = (lastPacketTime < (BOOT_CHECK_TIMEOUT / 2));
 
       if (wifiNotConnected || dataIsStale) {
@@ -263,7 +291,7 @@ void loop() {
 
     TJpgDec.drawJpg(0, 0, jpegBuffers[writeIdx], frameSizes[writeIdx]);
     
-    tft.dmaWait(); // Standard wait
+    tft.dmaWait(); 
 
     tft.pushImageDMA(0, 0, tft.width(), tft.height(), (uint16_t*)spr[sprIdx]->getPointer());
     sprIdx = !sprIdx; 
@@ -271,7 +299,7 @@ void loop() {
     frameReady = false; 
   }
 
-  // --- REPORTING (FULL STATS RESTORED) ---
+  // --- REPORTING (EXACT ORIGINAL LOGIC) ---
   uint32_t timeDiff = millis() - stat_lastReportTime;
   if (timeDiff > 2000) {
     float fps = (float)stat_framesReceived / (timeDiff / 1000.0);
