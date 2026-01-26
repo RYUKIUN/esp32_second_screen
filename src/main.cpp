@@ -16,7 +16,7 @@ const int BOOT_PIN = 0; // Standard Boot button on ESP32
 
 // --- SLEEP SETTINGS ---
 // 1. "After boot, count for set amount of second" (e.g., 10s)
-const unsigned long BOOT_CHECK_TIMEOUT = 10000; 
+const unsigned long BOOT_CHECK_TIMEOUT = 20000; 
 
 // --- OBJECTS ---
 TFT_eSPI tft = TFT_eSPI();
