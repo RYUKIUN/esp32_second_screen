@@ -17,11 +17,12 @@ const int BOOT_PIN = 0;
 #define SCREEN_W 160
 #define SCREEN_H 128
 
-// --- OBJECTS ---
+// --- OBJECTS & SEMAPHORES ---
 TFT_eSPI tft = TFT_eSPI();
 WiFiUDP udp;
 TFT_eSprite* spr[2]; 
-uint8_t sprIdx = 0;          
+uint8_t sprIdx = 0; 
+SemaphoreHandle_t bin_sem_button;
 
 // --- NETWORK & STATS VARIABLES ---
 uint32_t stat_packetsReceived = 0;
@@ -31,8 +32,8 @@ uint32_t stat_oversizedFrames = 0;
 uint32_t stat_decodeTimeTotal = 0;
 uint32_t stat_lastReportTime = 0;
 uint32_t stat_totalJpegBytes = 0; 
-uint32_t stat_prevFrameTime = 0;  
-float stat_jitter = 0.0;          
+uint32_t stat_prevFrameTime = 0;   
+float stat_jitter = 0.0;           
 
 uint8_t* jpegBuffers[BUFFER_COUNT];
 volatile int frameSizes[BUFFER_COUNT];
@@ -45,7 +46,8 @@ uint8_t expectedChunk = 0;
 bool isFrameCorrupt = false;
 volatile unsigned long lastPacketTime = 0; 
 
-// --- SLEEP & ANIMATION CONTROL ---
+// --- STATE CONTROL ---
+volatile bool isSwitching = false; // Prevents stream drawing during button hold
 bool sleepCheckPerformed = false;
 volatile bool isSleeping = false;
 const unsigned long BOOT_CHECK_TIMEOUT = 20000; 
@@ -53,7 +55,15 @@ const unsigned long BOOT_CHECK_TIMEOUT = 20000;
 uint8_t animFrame = 0;
 unsigned long lastAnimUpdate = 0;
 
-// --- COOL GRAPHICS FUNCTIONS ---
+// --- ISR HANDLER ---
+// Triggers the moment the button is pressed
+void IRAM_ATTR buttonISR() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(bin_sem_button, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+// --- GRAPHICS FUNCTIONS ---
 
 void drawHeader(String title, uint16_t color) {
     tft.fillRect(0, 0, SCREEN_W, 16, color);
@@ -63,15 +73,11 @@ void drawHeader(String title, uint16_t color) {
     tft.drawFastHLine(0, 17, SCREEN_W, TFT_DARKGREY);
 }
 
-// Unified function for Loading (WiFi) and Loaded (Waiting for Stream)
 void drawScannerEffect(String status, bool wifiConnected) {
+    if (isSwitching) return; // Don't interrupt the switcher UI
     tft.fillScreen(TFT_BLACK);
-    
-    // Background Grid
     for (int i = 0; i < SCREEN_W; i += 20) tft.drawFastVLine(i, 20, SCREEN_H, 0x0841); 
     for (int i = 20; i < SCREEN_H; i += 20) tft.drawFastHLine(0, i, SCREEN_W, 0x0841);
-    
-    // Header changes color based on state
     drawHeader(wifiConnected ? "NETWORK LOADED" : "SYSTEM LOADING", wifiConnected ? 0x03E0 : 0x001F);
     
     tft.drawRoundRect(15, 50, SCREEN_W - 30, 40, 4, TFT_CYAN);
@@ -83,48 +89,30 @@ void drawScannerEffect(String status, bool wifiConnected) {
     int animY = 105;
 
     if (!wifiConnected) {
-        // ANIMATION: Pulsing Signal Bars (WiFi Loading)
         int bars = (animFrame % 4) + 1;
         for (int i = 0; i < 4; i++) {
-            uint16_t barCol = (i < bars) ? TFT_CYAN : 0x2104; // Dim gray
+            uint16_t barCol = (i < bars) ? TFT_CYAN : 0x2104;
             tft.fillRect(centerX - 15 + (i * 8), animY - (i * 3), 5, 5 + (i * 3), barCol);
         }
     } else {
-        // ANIMATION: Rotating Tech Triangle (Waiting for Stream)
         float angle = animFrame * 0.3;
         int size = 9;
-        int x0 = centerX + cos(angle) * size;
-        int y0 = animY + sin(angle) * size;
-        int x1 = centerX + cos(angle + 2.09) * size;
-        int y1 = animY + sin(angle + 2.09) * size;
-        int x2 = centerX + cos(angle + 4.18) * size;
-        int y2 = animY + sin(angle + 4.18) * size;
-        
-        tft.drawTriangle(x0, y0, x1, y1, x2, y2, 0x07FF); // Cyan-White
-        tft.drawCircle(centerX, animY, 14, 0x03E0);      // Green ring
+        tft.drawTriangle(centerX + cos(angle)*size, animY + sin(angle)*size, 
+                         centerX + cos(angle+2.09)*size, animY + sin(angle+2.09)*size, 
+                         centerX + cos(angle+4.18)*size, animY + sin(angle+4.18)*size, 0x07FF);
+        tft.drawCircle(centerX, animY, 14, 0x03E0);
     }
     animFrame++;
 }
 
-void drawSleepGraphic() {
-    tft.fillScreen(TFT_BLACK);
-    for (int i = 0; i < 30; i++) tft.drawPixel(random(SCREEN_W), random(SCREEN_H), TFT_WHITE);
-    // Crescent Moon
-    tft.fillCircle(SCREEN_W / 2, SCREEN_H / 2 - 10, 20, 0xFFE0); 
-    tft.fillCircle(SCREEN_W / 2 + 8, SCREEN_H / 2 - 15, 18, TFT_BLACK); 
-    
-    tft.setTextColor(TFT_LIGHTGREY);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("SYSTEM HIBERNATED", SCREEN_W / 2, SCREEN_H - 30);
-}
-
 void drawSwitchingGraphic(int progress) {
+    isSwitching = true; // Tell the main loop to stop rendering frames
     tft.fillScreen(TFT_BLACK);
     drawHeader("PARTITION SWITCH", TFT_RED);
     int centerX = SCREEN_W / 2;
     int centerY = SCREEN_H / 2 + 10;
     
-    tft.drawCircle(centerX, centerY, 32, 0x4208); // Dark circle
+    tft.drawCircle(centerX, centerY, 32, 0x4208);
     float endAngle = (progress / 100.0) * 360.0;
     for (int i = 0; i < endAngle; i += 10) {
         float rad = (i - 90) * 0.0174533;
@@ -134,6 +122,16 @@ void drawSwitchingGraphic(int progress) {
     tft.setTextDatum(MC_DATUM);
     tft.drawNumber(progress, centerX, centerY, 2);
     tft.drawString("%", centerX + 18, centerY);
+}
+
+void drawSleepGraphic() {
+    tft.fillScreen(TFT_BLACK);
+    for (int i = 0; i < 30; i++) tft.drawPixel(random(SCREEN_W), random(SCREEN_H), TFT_WHITE);
+    tft.fillCircle(SCREEN_W / 2, SCREEN_H / 2 - 10, 20, 0xFFE0); 
+    tft.fillCircle(SCREEN_W / 2 + 8, SCREEN_H / 2 - 15, 18, TFT_BLACK); 
+    tft.setTextColor(TFT_LIGHTGREY);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("SYSTEM HIBERNATED", SCREEN_W / 2, SCREEN_H - 30);
 }
 
 // --- APP SWITCHER ---
@@ -152,12 +150,34 @@ void switchToOtherApp() {
 
 // --- TFT RENDERING CALLBACK ---
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  if (x < 0 || y < 0 || (x + w) > 160 || (y + h) > 128) return 0;
+  if (isSwitching || x < 0 || y < 0 || (x + w) > 160 || (y + h) > 128) return 0;
   spr[sprIdx]->pushImage(x, y, w, h, bitmap);
   return 1;
 }
 
-// --- NETWORK TASK (Core 0) ---
+// --- HIGH PRIORITY BUTTON TASK (CORE 1) ---
+void buttonTask(void * pvParameters) {
+    while (true) {
+        // Blocks here until the ISR "gives" the semaphore
+        if (xSemaphoreTake(bin_sem_button, portMAX_DELAY)) {
+            unsigned long btnPressStart = millis();
+            bool triggered = false;
+
+            while (digitalRead(BOOT_PIN) == LOW) {
+                unsigned long duration = millis() - btnPressStart;
+                if (duration > 500) { 
+                    triggered = true;
+                    drawSwitchingGraphic(map(min(duration, 4000UL), 500, 4000, 0, 100));
+                }
+                if (duration > 4000) switchToOtherApp();
+                vTaskDelay(pdMS_TO_TICKS(20)); 
+            }
+            isSwitching = false; // Release the screen back to the stream
+        }
+    }
+}
+
+// --- NETWORK TASK (CORE 0) ---
 void networkTask(void * parameter) {
   udp.begin(udpPort);
   while (true) {
@@ -194,7 +214,6 @@ void networkTask(void * parameter) {
                frameSizes[targetIdx] = currentFrameSize;
                writeIdx = targetIdx;
                frameReady = true;
-               stat_framesReceived++;
             }
           } else { isFrameCorrupt = true; stat_oversizedFrames++; }
         }
@@ -228,6 +247,17 @@ void enterLightSleep() {
 void setup() {
   Serial.begin(115200);
   pinMode(BOOT_PIN, INPUT_PULLUP);
+  
+  // 1. INITIALIZE BUTTON LOGIC IMMEDIATELY
+  // This must happen before any blocking WiFi loops
+  bin_sem_button = xSemaphoreCreateBinary();
+  attachInterrupt(digitalPinToInterrupt(BOOT_PIN), buttonISR, FALLING);
+
+  // 2. CREATE THE BUTTON TASK NOW
+  // Setting this to Priority 24 ensures it can interrupt the WiFi loop below
+  xTaskCreatePinnedToCore(buttonTask, "BtnTask", 4096, NULL, 24, NULL, 1);
+
+  // 3. PROCEED WITH HARDWARE & WIFI
   for (int i=0; i<BUFFER_COUNT; i++) jpegBuffers[i] = (uint8_t*)malloc(MAX_JPEG_SIZE);
 
   tft.init();
@@ -247,38 +277,24 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifi_ssid, wifi_pass);
 
-  // Initial WiFi Loading Animation
+  // NOW, while the CPU is stuck in this loop, the "buttonTask" 
+  // is already alive and running on Priority 24.
   while (WiFi.status() != WL_CONNECTED) { 
     drawScannerEffect("LINKING WIFI", false);
     delay(150); 
   }
 
+  // 4. START OTHER BACKGROUND TASKS
   xTaskCreatePinnedToCore(networkTask, "WiFiTask", 10000, NULL, 2, NULL, 0);
+
   stat_lastReportTime = millis();
   lastPacketTime = millis(); 
   tft.startWrite(); 
 }
 
 void loop() {
-  // --- BUTTON CHECK (APP SWITCHER) ---
-  static unsigned long btnPressStart = 0;
-  static bool btnHeld = false;
-  
-  if (digitalRead(BOOT_PIN) == LOW) {
-      if (!btnHeld) { btnPressStart = millis(); btnHeld = true; }
-      unsigned long duration = millis() - btnPressStart;
-      if (duration > 800) drawSwitchingGraphic(map(min(duration, 4000UL), 800, 4000, 0, 100));
-      if (duration > 4000) switchToOtherApp();
-  } else { btnHeld = false; }
-
-  // --- SLEEP CHECK ---
-  if (!sleepCheckPerformed && millis() > BOOT_CHECK_TIMEOUT) {
-      sleepCheckPerformed = true; 
-      if (WiFi.status() != WL_CONNECTED || (millis() - lastPacketTime > 10000)) enterLightSleep();
-  }
-
   // --- RENDERING & IDLE ANIMATION ---
-  if (!isSleeping) {
+  if (!isSleeping && !isSwitching) {
       if (frameReady) {
           uint32_t startTime = millis();
           
@@ -300,15 +316,21 @@ void loop() {
           tft.pushImageDMA(0, 0, tft.width(), tft.height(), (uint16_t*)spr[sprIdx]->getPointer());
           sprIdx = !sprIdx; 
           stat_decodeTimeTotal += (millis() - startTime);
+          stat_framesReceived++;
           frameReady = false; 
       } 
       else if (millis() - lastPacketTime > 1200) {
-          // No stream data? Play the "Waiting/Loaded" animation
           if (millis() - lastAnimUpdate > 50) { 
               drawScannerEffect("WAITING FOR DATA", true);
               lastAnimUpdate = millis();
           }
       }
+  }
+
+  // --- SLEEP CHECK ---
+  if (!sleepCheckPerformed && millis() > BOOT_CHECK_TIMEOUT) {
+      sleepCheckPerformed = true; 
+      if (WiFi.status() != WL_CONNECTED || (millis() - lastPacketTime > 10000)) enterLightSleep();
   }
 
   // --- STATISTICS REPORTING ---
@@ -330,12 +352,8 @@ void loop() {
     Serial.printf("Oversized Drops:    %u\n", stat_oversizedFrames);
     Serial.println("-------------------------");
 
-    stat_packetsReceived = 0;
-    stat_framesReceived = 0;
-    stat_framesDropped = 0;
-    stat_oversizedFrames = 0;
-    stat_decodeTimeTotal = 0;
-    stat_totalJpegBytes = 0;
+    stat_packetsReceived = 0; stat_framesReceived = 0; stat_framesDropped = 0;
+    stat_oversizedFrames = 0; stat_decodeTimeTotal = 0; stat_totalJpegBytes = 0;
     stat_lastReportTime = millis();
   }
 }
