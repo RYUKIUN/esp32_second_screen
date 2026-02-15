@@ -10,7 +10,6 @@ import threading
 from queue import Queue
 
 # --- CONFIGURATION ---
-DEBUG_PERFORMANCE = True
 PORT = 12345
 ESP_W, ESP_H = 160, 128
 DEFAULT_JPEG_QUALITY = 70
@@ -18,15 +17,13 @@ MAX_UDP_PAYLOAD = 1024
 DEFAULT_FPS = 80
 WINDOW_NAME = "Stream Control"
 
-# Thread-safe queue for frames (Max 1 frame to keep latency low)
+# Thread-safe queue
 frame_queue = Queue(maxsize=1)
 
 # --- SYSTEM HELPERS ---
 def set_high_resolution_timer():
     if os.name == 'nt':
-        try:
-            ctypes.windll.winmm.timeBeginPeriod(1)
-            print("⏱️  System timer resolution set to 1ms.")
+        try: ctypes.windll.winmm.timeBeginPeriod(1)
         except: pass
 
 def reset_resolution_timer():
@@ -88,70 +85,85 @@ def find_esp32():
     finally:
         sock.close()
 
-# --- CAPTURE THREAD (PRODUCER) ---
+# --- CAPTURE THREAD ---
 def capture_worker(monitor_idx):
     with mss.mss() as sct:
         monitor = sct.monitors[monitor_idx]
         m_h, m_w = monitor["height"], monitor["width"]
         
         while True:
-            # Grab frame
             sct_img = sct.grab(monitor)
-            
-            # Fast raw conversion (Ryzen optimized)
             img_bgra = np.frombuffer(sct_img.raw, dtype=np.uint8).reshape((m_h, m_w, 4))
             frame = img_bgra[:, :, :3].copy()
             
-            # Update queue (Overwrite old frame if queue is full)
             if frame_queue.full():
                 try: frame_queue.get_nowait()
                 except: pass
             frame_queue.put(frame)
 
-# --- MAIN STREAM THREAD (CONSUMER) ---
+# --- MAIN STREAM THREAD ---
 def stream_mss_udp(target_ip, monitor_idx):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', 0)) 
+    sock.setblocking(False)   
     
-    # Setup UI
+    # UI Setup
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 400, 500)
+    
+    # CONTROLS
     cv2.createTrackbar("FPS", WINDOW_NAME, DEFAULT_FPS, 60, lambda x: None)
     cv2.createTrackbar("Quality", WINDOW_NAME, DEFAULT_JPEG_QUALITY, 100, lambda x: None)
     cv2.createTrackbar("Mode (0:Area 1:Lin)", WINDOW_NAME, 0, 1, lambda x: None)
+    cv2.createTrackbar("Debug Info", WINDOW_NAME, 0, 1, lambda x: None)
 
-    # Start Capture Thread
     t = threading.Thread(target=capture_worker, args=(monitor_idx,), daemon=True)
     t.start()
     
-    # Get monitor offset for mouse calc
     with mss.mss() as sct:
         m = sct.monitors[monitor_idx]
         m_left, m_top, m_w, m_h = m["left"], m["top"], m["width"], m["height"]
 
-    frame_count = 0
-    stat_start = time.time()
-    acc_proc, acc_enc, acc_send = 0, 0, 0
+    print(f"🚀 Stream Started -> {target_ip}")
+    print("ℹ️  Use the 'Debug Info' slider in the window to toggle stats.")
 
-    print(f"🚀 Threaded Stream Started -> {target_ip}")
-
+    last_debug_send = 0
+    latest_esp_log = "Waiting for stats..."
+    
     try:
         while True:
             t_loop_start = time.perf_counter()
             
-            # 1. UI Inputs
+            # --- 1. HANDLE UI INPUTS ---
             fps = cv2.getTrackbarPos("FPS", WINDOW_NAME)
             qual = cv2.getTrackbarPos("Quality", WINDOW_NAME)
             mode = cv2.getTrackbarPos("Mode (0:Area 1:Lin)", WINDOW_NAME)
+            debug_state = cv2.getTrackbarPos("Debug Info", WINDOW_NAME)
+            
             target_dt = 1.0 / max(1, fps)
 
-            # 2. Get latest frame
+            # --- 2. RECEIVE UDP STATS ---
+            try:
+                while True: 
+                    data, _ = sock.recvfrom(1024)
+                    if len(data) > 2 and data[0] == 0xAB and data[1] == 0xCD:
+                        latest_esp_log = data[2:].decode('utf-8', errors='ignore')
+            except BlockingIOError: pass
+            except Exception: pass
+
+            # --- 3. SEND CONTROL PACKET ---
+            if time.time() - last_debug_send > 0.5:
+                packet = bytes([0xAA, 0xCC, 0x01, debug_state])
+                sock.sendto(packet, (target_ip, PORT))
+                last_debug_send = time.time()
+
+            # --- 4. GET FRAME ---
             if frame_queue.empty():
                 time.sleep(0.001)
                 continue
             frame = frame_queue.get()
 
-            # 3. Process (Mouse + Resize)
-            t_proc_s = time.perf_counter()
+            # --- 5. PROCESS FRAME ---
             mx, my = get_mouse_pos()
             rel_x, rel_y = mx - m_left, my - m_top
             
@@ -161,38 +173,47 @@ def stream_mss_udp(target_ip, monitor_idx):
             
             interp = cv2.INTER_AREA if mode == 0 else cv2.INTER_LINEAR
             resized = cv2.resize(frame, (ESP_W, ESP_H), interpolation=interp)
-            acc_proc += (time.perf_counter() - t_proc_s)
 
-            # 4. Encode
-            t_enc_s = time.perf_counter()
-            _, encoded = cv2.imencode('.jpg', resized, [int(cv2.IMWRITE_JPEG_QUALITY), max(10, qual)])
-            data = encoded.tobytes()
-            acc_enc += (time.perf_counter() - t_enc_s)
+            # --- 6. ENCODE (COMPRESS) ---
+            # We use 'encoded_buf' for both sending and decoding locally
+            ret, encoded_buf = cv2.imencode('.jpg', resized, [int(cv2.IMWRITE_JPEG_QUALITY), max(10, qual)])
+            
+            if ret:
+                data = encoded_buf.tobytes()
+                
+                # --- SEND ---
+                total = len(data)
+                chunks = (total + MAX_UDP_PAYLOAD - 1) // MAX_UDP_PAYLOAD
+                for i in range(chunks):
+                    start, end = i * MAX_UDP_PAYLOAD, min((i+1)*MAX_UDP_PAYLOAD, total)
+                    header = bytes([0xAA, 0xBB, i, chunks])
+                    sock.sendto(header + data[start:end], (target_ip, PORT))
+                    if i % 2 == 0: time.sleep(0)
 
-            # 5. Send
-            t_snd_s = time.perf_counter()
-            total = len(data)
-            chunks = (total + MAX_UDP_PAYLOAD - 1) // MAX_UDP_PAYLOAD
-            for i in range(chunks):
-                start, end = i * MAX_UDP_PAYLOAD, min((i+1)*MAX_UDP_PAYLOAD, total)
-                sock.sendto(bytes([0xAA, 0xBB, i]) + data[start:end], (target_ip, PORT))
-                if chunks > 5: time.sleep(0.0001) # Tiny pacing
-            acc_send += (time.perf_counter() - t_snd_s)
+                # --- 7. DECODE FOR PREVIEW (SHOW COMPRESSION ARTIFACTS) ---
+                # This ensures the preview looks exactly like what the ESP32 receives
+                decompressed_frame = cv2.imdecode(encoded_buf, cv2.IMREAD_COLOR)
+                
+                # Upscale for visibility on PC screen
+                preview = cv2.resize(decompressed_frame, (400, 320), interpolation=cv2.INTER_NEAREST)
 
-            # 6. Show Preview (Delayed to prioritize network)
-            cv2.imshow(WINDOW_NAME, resized)
+                # If UI Toggle is ON (1), draw the overlay
+                if debug_state == 1:
+                    overlay = preview.copy()
+                    cv2.rectangle(overlay, (0, 0), (400, 320), (0, 0, 0), -1)
+                    preview = cv2.addWeighted(overlay, 0.85, preview, 0.15, 0)
+                    
+                    y_offset = 30
+                    for line in latest_esp_log.split('|'):
+                        cv2.putText(preview, line.strip(), (10, y_offset), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                        y_offset += 25
+                    
+                    cv2.putText(preview, "[DEBUG ON]", (300, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                
+                cv2.imshow(WINDOW_NAME, preview)
 
-            # Stats
-            frame_count += 1
-            if time.time() - stat_start >= 1.0:
-                if DEBUG_PERFORMANCE:
-                    avg = lambda x: (x / frame_count) * 1000
-                    print(f"[THREADED] FPS: {frame_count/(time.time()-stat_start):.1f} | "
-                          f"Proc:{avg(acc_proc):.1f}ms Enc:{avg(acc_enc):.1f}ms Send:{avg(acc_send):.1f}ms")
-                frame_count, acc_proc, acc_enc, acc_send = 0, 0, 0, 0
-                stat_start = time.time()
-
-            # Timing
+            # --- 8. LOOP TIMING ---
             elapsed = time.perf_counter() - t_loop_start
             wait = max(1, int((target_dt - elapsed) * 1000))
             if cv2.waitKey(wait) & 0xFF == ord('q'):
@@ -207,15 +228,13 @@ def stream_mss_udp(target_ip, monitor_idx):
 if __name__ == "__main__":
     set_high_priority()
     set_high_resolution_timer()
-    
     try:
         mon_idx = select_display_mss()
         found_ip = find_esp32()
-        
         if found_ip:
             time.sleep(0.5)
             stream_mss_udp(found_ip, mon_idx)
         else:
-            print("❌ ESP32 not found. Check if it's powered on and on the same Wi-Fi.")
+            print("❌ ESP32 not found.")
     finally:
         reset_resolution_timer()
