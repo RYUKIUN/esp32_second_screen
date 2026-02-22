@@ -1,23 +1,23 @@
-# 📺 ESP32 WiFi Screen Cast (High Performance)
+# 📺 ESP32 WiFi Screen Cast (High Performance & Auto-Tuning)
 
 **A low-latency, high-FPS wireless monitor for ~$5 USD.**
 
-Stream your PC screen to an ESP32 + ST7735 display over WiFi using raw UDP packets and JPEG compression. Unlike standard libraries, this project pushes the ESP32 to its absolute limit using **Dual Core processing** and **DMA (Direct Memory Access)** to achieve **30+ FPS**.
+Stream your PC screen to an ESP32 + ST7735 display over WiFi using raw UDP packets and dynamic JPEG compression. Unlike standard libraries, this project pushes the ESP32 to its absolute limit using **Dual Core processing**, **DMA (Direct Memory Access)**, and **V-Sync Emulation** to achieve highly stable framerates.
 
 > **Note:** This project relies on the **[Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)** to create a secondary virtual screen for capturing.
 
-![Project Demo]
-![VID_20260116_123316 (online-video-cutter com)](https://github.com/user-attachments/assets/57c621a4-8890-4f75-a39a-c1185c0ca01d)
 
+![VID_20260222_222110-ezgif com-video-to-gif-converter (1)](https://github.com/user-attachments/assets/1c9d86de-bc17-4742-9170-f2eb2e47b324)
 
 
 
 ## 🚀 Features
-* **High Framerate:** Achieves **30-35 FPS** on a standard ESP32.
-* **Low Latency:** Uses UDP for real-time streaming (no TCP overhead).
+* **Auto-Discovery:** No need to hardcode IP addresses; the Python script automatically finds your ESP32 on the network.
+* **Two-Way Telemetry:** Real-time ESP32 stats (FPS, CPU Temp, Network Jitter, RAM) are sent back and displayed on your PC.
+* **AI-Assisted Dynamic Tuning:** A background profiler dynamically adjusts dithering, sharpness, and 4:4:4 / 4:2:0 subsampling based on scene complexity (SSIM) to stay under the strict 5.8KB network limit.
 * **Dual Core Architecture:** Separates WiFi networking (Core 0) from Image Decoding (Core 1).
-* **Hardware Acceleration:** Uses SPI DMA to paint the screen without blocking the CPU.
-* **Python Sender:** Custom desktop script with adjustable compression, scaling, and transmission throttling.
+* **Hardware V-Sync:** Emulates V-Sync delays and boosts the internal ST7735 refresh rate to prevent screen tearing.
+* **Cursor Tracking:** The Python sender automatically captures and draws your mouse cursor onto the stream.
 
 ## 🛠 Hardware Required
 * **ESP32 Development Board** (ESP32-WROOM-32 recommended).
@@ -49,66 +49,51 @@ Based on the provided `platformio.ini` configuration:
 
 1.  Open the `ESP32_Firmware` folder in **VS Code** (with PlatformIO extension).
 2.  Open `platformio.ini` and verify the pin definitions match your wiring.
-3.  **WiFi Setup:** Open the main `.cpp` file and look for the **Configuration** section. Update the `SSID` and `PASSWORD` to match your PC's hotspot (or the router you are connecting to).
+3.  **WiFi Setup:** Open `main.cpp` and look for the **CONFIG** section. Update the `wifi_ssid` and `wifi_pass` to match your PC's hotspot or local network.
 4.  **Upload** the code to your ESP32.
-5.  Open the **Serial Monitor** (Baud Rate: 115200). It should show: `Waiting for Stream...` and display the **ESP32's IP Address**.
+5.  The screen will remain black initially while it waits for the UDP stream to start.
 
 ### Part 2: PC Sender (Python)
-1.  **Python Setup:** Install Python **3.11** (recommended version for compatibility).
+1.  **Python Setup:** Install Python **3.11** (recommended version).
 2.  **Virtual Display:**
     * Download and install the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver).
-    * **Resolution Rule:** The program automatically looks for a display with a lower resolution than your main monitor.
-    * **Recommendation:** Set the virtual second screen resolution to **800x600** in Windows Settings.
+    * **Recommendation:** Set the virtual second screen resolution to **1366*7668** in Windows Settings. The script automatically targets the monitor with a resolution under 1920 pixels wide.
 3.  **Dependencies:** Install the required libraries with this command:
     ```bash
-    pip install opencv-python dxcam numpy psutil
+    pip install opencv-python mss numpy psutil scikit-image
     ```
-   
-4.  **Connection:**
-    * Ensure your PC Hotspot is ON (or both devices are on the same WiFi).
-    * *Tip:* If using a hotspot, turn it on and wait ~4 seconds before connecting the ESP32.
-5.  **Configuration:**
-    * Open `capture.py`.
-    * Edit the `UDP_IP` line to match the IP address shown on your ESP32's screen:
-        ```python
-        UDP_IP = "192.168.1.XXX"
-        ```
-       
-6.  **Run:** Execute the script (`python capture.py`).
+4.  **Connection:** Ensure your PC and the ESP32 are on the same WiFi network (or use a PC Mobile Hotspot for the lowest latency).
+5.  **Run:** Execute the script:
+    ```bash
+    python capture.py
+    ```
+    The script will automatically discover the ESP32 and begin streaming.
 
 ---
 
-## ⚙️ Performance Tuning Guide
-To get the best FPS, you must balance **JPEG Quality** vs **Network Budget**.
+## ⚙️ Control Panel & Tuning
+When you run `capture.py`, an OpenCV control window will appear. Use the trackbars to optimize your stream:
 
-| Setting | Value | Note |
-| :--- | :--- | :--- |
-| **FPS Target** | **30** | Going higher than 30 exceeds the ESP32 decoder's physical limit (~33ms decode time). |
-| **JPEG Quality** | **80-90%** | The "Sweet Spot." 100% quality triples the file size but barely looks different visually. |
-| **Mode** | **Left** vs **Right** | **Left:** Turns **ON** anti-aliasing (Recommended). Slightly blurs edges but significantly improves ESP32 decoding speed.<br>**Right:** Turns **OFF** anti-aliasing. Sharper image but higher CPU load. |
+| Trackbar | Function |
+| :--- | :--- |
+| **Max FPS** | Caps the capture rate. **40 FPS** is the default sweet spot. |
+| **Base Qual** | Sets the maximum desired JPEG quality (0-95). |
+| **Mode: FAST/TUNE** | **0 (FAST):** Uses simple heuristics for quick compression.<br>**1 (TUNE):** Enables the exhaustive background profiler to constantly calculate the highest possible visual quality (using structural similarity) that fits the network budget. |
+| **Debug Info** | Toggles the real-time ESP32 telemetry overlay (FPS, Temp, Jitter, RAM) on your PC preview window. |
+
+*(Note: Tuning profiles are automatically saved to `stream_profiles.json` upon exiting so the system learns your screen's content over time!)*
 
 ---
 
 ## 🐛 Troubleshooting
-Connect the ESP32 to the computer and open the Serial Monitor to see real-time logs.
 
 * **Screen stays black?**
     * Check your wiring against the table above.
-    * Check `platformio.ini` configuration.
-    * Try lowering the `SPI_FREQUENCY` in `platformio.ini` if your wires are long.
-* **Glitchy gray bars?**
-    * You are experiencing UDP packet loss.
-    * Try lowering the **FPS Target** or **JPEG Quality** slider.
-    * Ensure the ESP32 is close to the WiFi antenna.
-* **"Oversized Drop" Error?**
-    * The current image frame is too complex (file size > 20KB) for the ESP32's memory buffer.
-    * **Solution:** Lower the **JPEG Quality** slider immediately.
-
----
-
-## 🤝 Acknowledgments
-* **Gemini AI:** For generating the core high-performance code and optimization logic.
-* **Me (The Human):** For tweaking, debugging, and testing the physical limits of the hardware.
-* **[VirtualDrivers](https://github.com/VirtualDrivers/Virtual-Display-Driver):** Huge thanks for the virtual display driver, which saved this project from requiring custom driver development.
-
-**Disclaimer:** This project pushes the ESP32 to its limit. If you encounter issues, they are likely setup-related. Feel free to report major bugs, but please double-check your wiring and WiFi environment first.
+    * Ensure the ESP32 and PC are on the same network. 
+    * If auto-discovery fails, verify no firewall is blocking UDP Port `12345`.
+* **High Jitter or Glitchy Frames?**
+    * You are experiencing UDP packet loss. Turn on the **Debug Info** slider to monitor the `Jitter` stat from the ESP32.
+    * Move the ESP32 closer to the router/PC.
+    * Lower the **Base Qual** slider to reduce the payload size.
+* **High CPU Usage on PC?**
+    * The `TUNE` mode runs an exhaustive background profiler. If your PC struggles, switch the Mode trackbar to `0 (FAST)`.d
